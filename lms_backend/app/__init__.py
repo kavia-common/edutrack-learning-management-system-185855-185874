@@ -1,5 +1,7 @@
 import os
+import time
 from datetime import timedelta
+from typing import Optional
 
 from flask import Flask, jsonify
 from flask_cors import CORS
@@ -8,15 +10,17 @@ from flask_jwt_extended import JWTManager
 from flask_sqlalchemy import SQLAlchemy
 from flask_migrate import Migrate
 from flask_socketio import SocketIO
+from sqlalchemy import text
+from dotenv import load_dotenv
+
+# Load environment variables from .env if present (non-fatal if missing)
+load_dotenv()
 
 # Initialize extensions (to be bound in create_app)
 db = SQLAlchemy()
 migrate = Migrate()
 jwt = JWTManager()
 socketio = SocketIO(async_mode="threading", cors_allowed_origins="*")  # Flask-SocketIO
-
-# Blueprints imports (routes)
-# Note: Imports inside create_app to avoid circulars on extensions
 
 
 class Config:
@@ -25,9 +29,18 @@ class Config:
     DEBUG = os.getenv("FLASK_DEBUG", "0") == "1"
     TESTING = os.getenv("FLASK_TESTING", "0") == "1"
 
-    # SQLAlchemy connection string; must be provided via env.
+    # SQLAlchemy connection string; prefer DATABASE_URL, else construct from components if provided
     # Example: mysql+pymysql://user:password@host:3306/dbname
-    SQLALCHEMY_DATABASE_URI = os.getenv("DATABASE_URL", "sqlite:///lms_dev.sqlite")
+    _db_url_env = os.getenv("DATABASE_URL")
+    if not _db_url_env:
+        db_user = os.getenv("DB_USER", os.getenv("MYSQL_USER"))
+        db_pass = os.getenv("DB_PASSWORD", os.getenv("MYSQL_PASSWORD"))
+        db_host = os.getenv("DB_HOST", os.getenv("MYSQL_HOST", "localhost"))
+        db_port = os.getenv("DB_PORT", os.getenv("MYSQL_PORT", "3306"))
+        db_name = os.getenv("DB_NAME", os.getenv("MYSQL_DB"))
+        if db_user and db_pass and db_host and db_name:
+            _db_url_env = f"mysql+pymysql://{db_user}:{db_pass}@{db_host}:{db_port}/{db_name}"
+    SQLALCHEMY_DATABASE_URI = _db_url_env or "sqlite:///lms_dev.sqlite"
     SQLALCHEMY_TRACK_MODIFICATIONS = False
     PROPAGATE_EXCEPTIONS = True
 
@@ -51,7 +64,7 @@ class Config:
     # CORS
     CORS_ORIGINS = os.getenv("CORS_ORIGINS", "*")
 
-    # Stripe
+    # Stripe (optional; should not block startup)
     STRIPE_SECRET_KEY = os.getenv("STRIPE_SECRET_KEY", "")
     STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET", "")
 
@@ -62,6 +75,38 @@ class Config:
     # Uploads
     UPLOAD_FOLDER = os.getenv("UPLOAD_FOLDER", "uploads")
     MAX_CONTENT_LENGTH = 100 * 1024 * 1024  # 100MB
+
+    # DB readiness wait configuration
+    DB_READY_MAX_RETRIES = int(os.getenv("DB_READY_MAX_RETRIES", "30"))
+    DB_READY_SLEEP_SECONDS = float(os.getenv("DB_READY_SLEEP_SECONDS", "2.0"))
+
+
+def _wait_for_database(app: Flask) -> Optional[str]:
+    """
+    Wait for the database to be reachable using a simple SELECT 1; returns None on success, or error string.
+    This avoids startup crashes when DB container is still initializing.
+    """
+    # If using SQLite local file/memory, no need to wait
+    uri = app.config.get("SQLALCHEMY_DATABASE_URI", "")
+    if uri.startswith("sqlite:"):
+        return None
+
+    max_retries = app.config.get("DB_READY_MAX_RETRIES", 30)
+    sleep_s = app.config.get("DB_READY_SLEEP_SECONDS", 2.0)
+
+    last_err = None
+    # Use a temporary engine via app.db engine after initialization
+    for attempt in range(1, int(max_retries) + 1):
+        try:
+            with app.app_context():
+                # Use a raw text query to avoid model imports here
+                db.session.execute(text("SELECT 1"))
+                db.session.commit()
+            return None
+        except Exception as e:
+            last_err = str(e)
+            time.sleep(float(sleep_s))
+    return last_err
 
 
 def create_app(config_object: type[Config] = Config) -> Flask:
@@ -83,7 +128,12 @@ def create_app(config_object: type[Config] = Config) -> Flask:
     migrate.init_app(app, db)
     jwt.init_app(app)
     CORS(app, resources={r"/*": {"origins": app.config["CORS_ORIGINS"]}})
-    socketio.init_app(app)
+    # Initialize socketio without blocking even if some async backends are missing
+    try:
+        socketio.init_app(app)
+    except Exception:
+        # Fallback: do not break app if Socket.IO cannot initialize in this environment
+        pass
 
     # Initialize API
     api = Api(app)
@@ -93,6 +143,13 @@ def create_app(config_object: type[Config] = Config) -> Flask:
         User, Role, Course, Lesson, Resource, Quiz, Question, Enrollment,
         Progress, Submission, Notification, Payment, AuditLog, QuizOption
     )
+
+    # Optionally wait for database readiness to avoid crashes on startup
+    db_err = _wait_for_database(app)
+    if db_err:
+        # Do not crash; allow app to start so health endpoint can be polled while DB becomes ready.
+        # Logging to stdout for visibility in container logs.
+        print(f"[startup] Database not ready after retries: {db_err}")
 
     # Register blueprints
     from .routes.health import blp as health_blp
